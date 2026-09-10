@@ -3,6 +3,7 @@
 #SBATCH --partition=comp3710
 #SBATCH --account=comp3710
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
 #SBATCH --time=01:00:00
 #SBATCH --output=dawnbench_resnet_%j.out
 #SBATCH --error=dawnbench_resnet_%j.err

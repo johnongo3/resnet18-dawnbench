@@ -12,17 +12,33 @@ import matplotlib.pyplot as plt
 # device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# input shapes are fixed, so let cuDNN autotune kernels once and reuse the plan
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+# bf16 has the same exponent range as fp32, so no GradScaler is needed
+use_amp = device.type == 'cuda' and torch.cuda.is_bf16_supported()
+
+def autocast():
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp)
+
 # hyperparameters
 num_epochs = 35
-learning_rate = 0.1
+batch_size = 512
+eval_batch_size = 1000
+learning_rate = 0.4  # linear scaling rule: 0.1 at batch 128 -> 0.4 at batch 512
+weight_decay = 5e-4
 weights_path = 'resnet18_cifar10.pth'
 num_val = 5000
+num_workers = 8
 
+# augment while the images are still uint8 PIL, then convert once
 transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
+    transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomCrop(32, padding=4, padding_mode='reflect'),
 ])
 
 transform_test = transforms.Compose([
@@ -37,13 +53,22 @@ valset = torchvision.datasets.CIFAR10(
     root='cifar10', train=True, download=True, transform=transform_test)
 indices = torch.randperm(len(trainset), generator=torch.Generator().manual_seed(42)).tolist()
 train_loader = torch.utils.data.DataLoader(
-    torch.utils.data.Subset(trainset, indices[num_val:]), batch_size=128, shuffle=True) #num_workers = 6
+    torch.utils.data.Subset(trainset, indices[num_val:]), batch_size=batch_size, shuffle=True,
+    num_workers=num_workers, pin_memory=True, persistent_workers=True, prefetch_factor=4,
+    drop_last=True)
 val_loader = torch.utils.data.DataLoader(
-    torch.utils.data.Subset(valset, indices[:num_val]), batch_size=100, shuffle=False)
+    torch.utils.data.Subset(valset, indices[:num_val]), batch_size=eval_batch_size, shuffle=False,
+    num_workers=4, pin_memory=True, persistent_workers=True)
 
 testset = torchvision.datasets.CIFAR10(
     root='cifar10', train=False, download=True, transform=transform_test)
-test_loader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False)
+test_loader = torch.utils.data.DataLoader(
+    testset, batch_size=eval_batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+def to_device(images, labels):
+    images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+    labels = labels.to(device, non_blocking=True)
+    return images, labels
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -83,6 +108,18 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
         self.linear = nn.Linear(512 * block.expansion, num_classes)
 
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+        # zero the last BN scale of each block so residual blocks start as identity maps,
+        # which converges noticeably faster on a short schedule
+        for m in self.modules():
+            if isinstance(m, BasicBlock):
+                nn.init.zeros_(m.bn2.weight)
+
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
@@ -105,21 +142,31 @@ class ResNet(nn.Module):
 def ResNet18():
     return ResNet(BasicBlock, [2, 2, 2, 2])
 
+def param_groups(model, weight_decay):
+    # BatchNorm scales/shifts and biases are 1-D; decaying them costs accuracy
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if p.requires_grad:
+            (no_decay if p.ndim <= 1 else decay).append(p)
+    return [{'params': decay, 'weight_decay': weight_decay},
+            {'params': no_decay, 'weight_decay': 0.0}]
+
 def evaluate(model, criterion, loader):
     model.eval()
-    loss_sum = 0.0
-    correct = 0
+    # accumulate on the GPU; calling .item() per batch would sync the pipeline
+    loss_sum = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device)
     total = 0
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            outputs = model(images)
-            loss_sum += criterion(outputs, labels).item() * labels.size(0)
-            _, predicted = torch.max(outputs.data, 1)
+            images, labels = to_device(images, labels)
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            loss_sum += loss.float() * labels.size(0)
+            correct += (outputs.argmax(1) == labels).sum()
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    return loss_sum / total, 100 * correct / total
+    return (loss_sum / total).item(), (100 * correct / total).item()
 
 def plot_history(history):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
@@ -135,12 +182,13 @@ def plot_history(history):
     print("Saved plots to training_curves.png")
 
 def train(model, criterion, path):
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
-    #Piecewise linear schedule
+    optimizer = torch.optim.SGD(param_groups(model, weight_decay), lr=learning_rate,
+                                momentum=0.9, nesterov=True)
+    # one cycle, stepped every batch: warm up to max_lr then cosine anneal to ~0
     total_step = len(train_loader)
-    sched_linear_1 = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=0.005, max_lr=learning_rate, step_size_up=15, step_size_down=15, mode="triangular")
-    sched_linear_3 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.005/learning_rate, end_factor=0.005/5)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[sched_linear_1, sched_linear_3], milestones=[30])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=learning_rate, total_steps=num_epochs * total_step,
+        pct_start=0.15, div_factor=8, final_div_factor=1e3, anneal_strategy='cos')
 
     # train model
     print("> Training")
@@ -148,39 +196,38 @@ def train(model, criterion, path):
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     for epoch in range(num_epochs):
         model.train()
-        loss_sum = 0.0
-        correct = 0
+        loss_sum = torch.zeros((), device=device)
+        correct = torch.zeros((), device=device)
         total = 0
-        for i, (images, labels) in enumerate(train_loader):
-            images = images.to(device)
-            labels = labels.to(device)
+        for images, labels in train_loader:
+            images, labels = to_device(images, labels)
 
             # Forward pass
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             # backward and optimise
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            last_lr = optimizer.param_groups[0]['lr']
             optimizer.step()
+            scheduler.step()
 
-            loss_sum += loss.item() * labels.size(0)
-            _, predicted = torch.max(outputs.data, 1)
+            loss_sum += loss.detach().float() * labels.size(0)
+            correct += (outputs.detach().argmax(1) == labels).sum()
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-
-            if (i + 1) % 100 == 0:
-                print("Epoch [{}/{}], Step [{}/{}], Loss: {:.5f}".format(epoch+1, num_epochs, i + 1, total_step, loss.item()))
-
-        scheduler.step()
 
         val_loss, val_acc = evaluate(model, criterion, val_loader)
-        history['train_loss'].append(loss_sum / total)
-        history['train_acc'].append(100 * correct / total)
+        history['train_loss'].append((loss_sum / total).item())
+        history['train_acc'].append((100 * correct / total).item())
         history['val_loss'].append(val_loss)
         history['val_acc'].append(val_acc)
-        print("Epoch [{}/{}], Train Loss: {:.5f}, Train Acc: {:.2f} %, Val Loss: {:.5f}, Val Acc: {:.2f} %".format(
-            epoch + 1, num_epochs, history['train_loss'][-1], history['train_acc'][-1], val_loss, val_acc))
+        print("Epoch [{}/{}], LR: {:.4f}, Train Loss: {:.5f}, Train Acc: {:.2f} %, Val Loss: {:.5f}, Val Acc: {:.2f} %".format(
+            epoch + 1, num_epochs, last_lr,
+            history['train_loss'][-1], history['train_acc'][-1], val_loss, val_acc))
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
     end = time.time()
     elapsed = end - start
     print("Training took " + str(elapsed) + " secs or " + str(elapsed / 60) + " mins in total")
@@ -206,7 +253,7 @@ def main():
     parser.add_argument('--weights', default=weights_path, help="path to the weights file")
     args = parser.parse_args()
 
-    model = ResNet18().to(device)
+    model = ResNet18().to(device).to(memory_format=torch.channels_last)
     criterion = nn.CrossEntropyLoss()
 
     if args.mode == 'inference':
