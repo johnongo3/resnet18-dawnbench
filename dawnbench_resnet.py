@@ -32,6 +32,9 @@ weight_decay = 5e-4
 weights_path = 'resnet18_cifar10.pth'
 num_val = 5000
 num_workers = 8
+cutout_size = 8  # pixels; 16 is the classic CIFAR-10 value but needs a longer schedule
+cutout_prob = 0.5
+cutout_area = cutout_size ** 2 / 32 ** 2
 
 # augment while the images are still uint8 PIL, then convert once
 transform_train = transforms.Compose([
@@ -39,6 +42,10 @@ transform_train = transforms.Compose([
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    # cutout: erase one fixed square. Applied after Normalize, so value=0 fills the
+    # hole with the dataset mean, which is what the original cutout paper does.
+    transforms.RandomErasing(p=cutout_prob, scale=(cutout_area, cutout_area),
+                             ratio=(1.0, 1.0), value=0.0),
 ])
 
 transform_test = transforms.Compose([
@@ -151,7 +158,7 @@ def param_groups(model, weight_decay):
     return [{'params': decay, 'weight_decay': weight_decay},
             {'params': no_decay, 'weight_decay': 0.0}]
 
-def evaluate(model, criterion, loader):
+def evaluate(model, criterion, loader, tta=False):
     model.eval()
     # accumulate on the GPU; calling .item() per batch would sync the pipeline
     loss_sum = torch.zeros((), device=device)
@@ -162,6 +169,10 @@ def evaluate(model, criterion, loader):
             images, labels = to_device(images, labels)
             with autocast():
                 outputs = model(images)
+                if tta:
+                    # average the logits over the image and its mirror
+                    flipped = images.flip(-1).contiguous(memory_format=torch.channels_last)
+                    outputs = (outputs + model(flipped)) / 2
                 loss = criterion(outputs, labels)
             loss_sum += loss.float() * labels.size(0)
             correct += (outputs.argmax(1) == labels).sum()
@@ -241,6 +252,8 @@ def test(model, criterion):
     start = time.time()
     _, accuracy = evaluate(model, criterion, test_loader)
     print("Test Accuracy: {} %".format(accuracy))
+    _, tta_accuracy = evaluate(model, criterion, test_loader, tta=True)
+    print("Test Accuracy (flip TTA): {} %".format(tta_accuracy))
     end = time.time()
     elapsed = end - start
     print("Testing took " + str(elapsed) + " secs or " + str(elapsed / 60) + " mins in total")
@@ -254,7 +267,7 @@ def main():
     args = parser.parse_args()
 
     model = ResNet18().to(device).to(memory_format=torch.channels_last)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     if args.mode == 'inference':
         model.load_state_dict(torch.load(args.weights, map_location=device))
